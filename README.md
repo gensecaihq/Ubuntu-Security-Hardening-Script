@@ -2,6 +2,7 @@
 
 **One command to harden Ubuntu — kernel to firewall, CIS-aligned, production-tested.**
 
+[![GitHub release](https://img.shields.io/github/v/release/gensecaihq/Ubuntu-Security-Hardening-Script)](https://github.com/gensecaihq/Ubuntu-Security-Hardening-Script/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Ubuntu](https://img.shields.io/badge/Ubuntu-18.04%20→%2026.04%20LTS-orange)](https://ubuntu.com/)
 [![Bash](https://img.shields.io/badge/Bash-5.0%2B-green)](https://www.gnu.org/software/bash/)
