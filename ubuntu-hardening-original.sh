@@ -20,6 +20,7 @@ IFS=$'\n\t'       # Set secure Internal Field Separator
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[0;33m'
+readonly BLUE='\033[0;34m'
 readonly NC='\033[0m' # No Color
 
 # Global variables
@@ -32,7 +33,7 @@ readonly REPORT_FILE="${LOG_DIR}/hardening_report_$(date +%Y%m%d-%H%M%S).txt"
 # Function to print colored output
 print_message() {
     local color=$1
-    local message=$2
+    local message=${2:-}
     echo -e "${color}[$(date '+%Y-%m-%d %H:%M:%S')] ${message}${NC}" | tee -a "$LOG_FILE"
 }
 
@@ -98,7 +99,8 @@ validate_frequency() {
             echo "$frequency"
             ;;
         *)
-            print_message "$YELLOW" "Invalid frequency. Using 'weekly' as default."
+            # Warning must go to stderr - stdout is captured by $(validate_frequency ...)
+            print_message "$YELLOW" "Invalid frequency. Using 'weekly' as default." >&2
             echo "weekly"
             ;;
     esac
@@ -258,12 +260,7 @@ admin_space_left = 50
 admin_space_left_action = SUSPEND
 disk_full_action = SUSPEND
 disk_error_action = SUSPEND
-use_libwrap = yes
-tcp_listen_queue = 5
-tcp_max_per_addr = 1
-tcp_client_max_idle = 0
 enable_krb5 = no
-krb5_principal = auditd
 EOF
 
     # Add basic audit rules
@@ -400,11 +397,12 @@ configure_clamav() {
     print_message "$GREEN" "Updating ClamAV virus database..."
     freshclam || print_message "$YELLOW" "WARNING: Failed to update ClamAV database"
     
-    # Start services
-    systemctl start clamav-freshclam
-    systemctl start clamav-daemon
-    systemctl enable clamav-freshclam
-    systemctl enable clamav-daemon
+    # Start services (guarded - clamav-daemon refuses to start until the
+    # signature DB exists; a freshclam failure must not abort the whole run)
+    systemctl start clamav-freshclam 2>/dev/null || print_message "$YELLOW" "WARNING: clamav-freshclam failed to start"
+    systemctl start clamav-daemon 2>/dev/null || print_message "$YELLOW" "WARNING: clamav-daemon failed to start (signature DB may still be downloading)"
+    systemctl enable clamav-freshclam 2>/dev/null || true
+    systemctl enable clamav-daemon 2>/dev/null || true
     
     # Get scan frequency from user
     print_message "$GREEN" "Please enter how often you want ClamAV scans to run (daily/weekly/monthly):"
@@ -549,7 +547,8 @@ sendername = Fail2Ban
 mta = sendmail
 protocol = tcp
 chain = INPUT
-action = %(action_mwl)s
+# Ban only - action_mwl needs a working MTA + whois, which are not installed
+action = %(action_)s
 
 # Progressive ban time - doubles with each offense (requires fail2ban 0.11+)
 bantime.increment = true
@@ -559,25 +558,16 @@ bantime.maxtime = 1d
 [sshd]
 enabled = true
 port = ssh
-filter = sshd
+filter = sshd[mode=aggressive]
 logpath = /var/log/auth.log
 maxretry = 5
 bantime = 10m
 findtime = 10m
-
-[sshd-ddos]
-enabled = true
-port = ssh
-filter = sshd
-logpath = /var/log/auth.log
-maxretry = 10
-findtime = 5m
-bantime = 10m
 EOF
 
-    # Restart fail2ban
-    systemctl restart fail2ban
-    systemctl enable fail2ban
+    # Restart fail2ban (guarded - a jail error must not abort the run)
+    systemctl restart fail2ban 2>/dev/null || print_message "$YELLOW" "WARNING: fail2ban restart failed"
+    systemctl enable fail2ban 2>/dev/null || true
 
     print_message "$GREEN" "Fail2ban configured with progressive banning"
 }
@@ -640,10 +630,10 @@ MaxAuthTries 3
 MaxSessions 10
 EOF
 
-    # Add AuthenticationMethods based on password_auth setting
-    if [[ "$password_auth" == "yes" ]]; then
-        echo "AuthenticationMethods publickey,password" >> /etc/ssh/sshd_config.d/99-hardening.conf
-    else
+    # Add AuthenticationMethods based on password_auth setting.
+    # When keeping password auth the directive is OMITTED: "publickey,password"
+    # (comma) would require BOTH methods, locking out password-only users.
+    if [[ "$password_auth" == "no" ]]; then
         echo "AuthenticationMethods publickey" >> /etc/ssh/sshd_config.d/99-hardening.conf
     fi
 
@@ -788,8 +778,10 @@ kernel.yama.ptrace_scope = 1
 EOF
 
     # Apply sysctl settings
-    sysctl -p /etc/sysctl.d/99-security.conf
-    
+    if ! sysctl -p /etc/sysctl.d/99-security.conf; then
+        print_message "$YELLOW" "WARNING: some sysctl keys were not applied (not available on this kernel)"
+    fi
+
     print_message "$GREEN" "Kernel parameters configured"
 }
 

@@ -17,6 +17,7 @@ Thumbs.db
 
 # Internal documentation (not for public repo)
 issue12.md
+CLAUDE.md
 
 # Logs and temp files
 *.log

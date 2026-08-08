@@ -41,7 +41,7 @@ readonly SUPPORTS_SNAP_STRICT_CONFINEMENT=true
 # Function to print colored output with timestamp
 print_message() {
     local color=$1
-    local message=$2
+    local message=${2:-}
     echo -e "${color}[$(date '+%Y-%m-%d %H:%M:%S')] ${message}${NC}" | tee -a "$LOG_FILE"
 }
 
@@ -141,7 +141,8 @@ validate_frequency() {
             echo "$frequency"
             ;;
         *)
-            print_message "$YELLOW" "Invalid frequency. Using 'weekly' as default."
+            # Warning must go to stderr - stdout is captured by $(validate_frequency ...)
+            print_message "$YELLOW" "Invalid frequency. Using 'weekly' as default." >&2
             echo "weekly"
             ;;
     esac
@@ -439,13 +440,6 @@ admin_space_left = 50
 admin_space_left_action = SUSPEND
 disk_full_action = SUSPEND
 disk_error_action = SUSPEND
-use_libwrap = yes
-tcp_listen_port = 60
-tcp_listen_queue = 5
-tcp_max_per_addr = 1
-tcp_client_max_idle = 0
-transport = TCP
-krb5_principal = auditd
 distribute_network = no
 q_depth = 1200
 overflow_action = SYSLOG
@@ -744,18 +738,19 @@ EOF
     sed -i 's/^Checks.*/Checks 24/' /etc/clamav/freshclam.conf 2>/dev/null || true
 
     # Stop services for configuration
-    systemctl stop clamav-freshclam
-    systemctl stop clamav-daemon
+    systemctl stop clamav-freshclam 2>/dev/null || true
+    systemctl stop clamav-daemon 2>/dev/null || true
 
     # Update virus database
     print_message "$GREEN" "Updating ClamAV virus database..."
     freshclam || print_message "$YELLOW" "WARNING: Failed to update ClamAV database"
 
-    # Start and enable services
-    systemctl start clamav-freshclam
-    systemctl start clamav-daemon
-    systemctl enable clamav-freshclam
-    systemctl enable clamav-daemon
+    # Start and enable services (guarded - clamav-daemon refuses to start
+    # until the signature DB exists; must not abort the whole run)
+    systemctl start clamav-freshclam 2>/dev/null || print_message "$YELLOW" "WARNING: clamav-freshclam failed to start"
+    systemctl start clamav-daemon 2>/dev/null || print_message "$YELLOW" "WARNING: clamav-daemon failed to start (signature DB may still be downloading)"
+    systemctl enable clamav-freshclam 2>/dev/null || true
+    systemctl enable clamav-daemon 2>/dev/null || true
 
     # Get scan frequency
     print_message "$GREEN" "Please enter how often you want ClamAV scans to run (daily/weekly/monthly):"
@@ -1030,8 +1025,8 @@ destemail = root@localhost
 sender = root@localhost
 mta = sendmail
 
-# Action
-action = %(action_mwl)s
+# Action: ban only - action_mwl needs a working MTA + whois, which are not installed
+action = %(action_)s
 
 # Ignore localhost and private networks
 # Add your CI/CD, monitoring, and trusted IPs here
@@ -1039,6 +1034,7 @@ ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
 
 [sshd]
 enabled = true
+mode = aggressive
 port = ssh
 logpath = %(sshd_log)s
 backend = %(sshd_backend)s
@@ -1046,28 +1042,12 @@ maxretry = 5
 bantime = 10m
 findtime = 10m
 
-[sshd-ddos]
-enabled = true
-port = ssh
-logpath = %(sshd_log)s
-backend = %(sshd_backend)s
-maxretry = 10
-findtime = 5m
-bantime = 10m
-
-# Ubuntu 24.04 - systemd journal monitoring
-[systemd-ssh]
-enabled = true
-backend = systemd
-journalmatch = _SYSTEMD_UNIT=sshd.service + _COMM=sshd
-maxretry = 3
-bantime = 2h
-
-# Protect against port scanning
+# Protect against port scanning (UFW BLOCK lines from the kernel journal;
+# backend=systemd is inherited from DEFAULT so no logpath is needed)
 [port-scan]
 enabled = true
 filter = port-scan
-logpath = /var/log/ufw.log
+journalmatch = _TRANSPORT=kernel
 maxretry = 2
 bantime = 1d
 findtime = 1d
@@ -1101,8 +1081,8 @@ failregex = .*UFW BLOCK.* SRC=<HOST>
 ignoreregex =
 EOF
 
-    # Restart fail2ban
-    systemctl restart fail2ban
+    # Restart fail2ban (guarded - a jail error must not abort the run)
+    systemctl restart fail2ban 2>/dev/null || print_message "$YELLOW" "WARNING: fail2ban restart failed"
     systemctl enable fail2ban
 
     print_message "$GREEN" "Fail2ban configured with systemd integration"
@@ -1173,10 +1153,10 @@ MaxAuthTries 3
 MaxSessions 10
 EOF
 
-    # Add AuthenticationMethods based on password_auth setting
-    if [[ "$password_auth" == "yes" ]]; then
-        echo "AuthenticationMethods publickey,password" >> /etc/ssh/sshd_config.d/99-hardening.conf
-    else
+    # Add AuthenticationMethods based on password_auth setting.
+    # When keeping password auth the directive is OMITTED: "publickey,password"
+    # (comma) would require BOTH methods, locking out password-only users.
+    if [[ "$password_auth" == "no" ]]; then
         echo "AuthenticationMethods publickey" >> /etc/ssh/sshd_config.d/99-hardening.conf
     fi
 
@@ -1444,8 +1424,8 @@ net.ipv4.tcp_max_syn_backlog = 2048
 net.ipv4.tcp_synack_retries = 2
 net.ipv4.tcp_syn_retries = 5
 
-# Disable TCP timestamps
-net.ipv4.tcp_timestamps = 0
+# TCP timestamps stay enabled (disabling breaks PAWS; uptime leak moot since kernel 4.10)
+net.ipv4.tcp_timestamps = 1
 
 # Enable TCP RFC 1337
 net.ipv4.tcp_rfc1337 = 1
@@ -1526,7 +1506,9 @@ kernel.printk = 3 3 3 3
 EOF
 
     # Apply sysctl settings
-    sysctl -p /etc/sysctl.d/99-security-hardening.conf
+    if ! sysctl -p /etc/sysctl.d/99-security-hardening.conf; then
+        print_message "$YELLOW" "WARNING: some sysctl keys were not applied (not available on this kernel)"
+    fi
 
     print_message "$GREEN" "Kernel parameters configured"
 }
@@ -1762,26 +1744,9 @@ configure_ubuntu_24_features() {
     # Configure enhanced systemd service sandboxing
     print_message "$BLUE" "Applying enhanced systemd service sandboxing..."
 
-    # SSH service hardening
-    mkdir -p /etc/systemd/system/ssh.service.d/
-    cat > /etc/systemd/system/ssh.service.d/hardening.conf << 'EOF'
-[Service]
-ProtectSystem=strict
-ProtectHome=read-only
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-RestrictNamespaces=yes
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-NoNewPrivileges=yes
-SystemCallArchitectures=native
-MemoryDenyWriteExecute=yes
-EOF
+    # NOTE: no sandbox drop-in for ssh.service - sshd spawns user sessions
+    # that inherit ProtectSystem/ProtectHome/NoNewPrivileges, which gives
+    # users a read-only filesystem and breaks sudo/su/passwd.
 
     # Fail2ban service hardening
     mkdir -p /etc/systemd/system/fail2ban.service.d/
@@ -1871,7 +1836,7 @@ configure_cloud_security() {
         local product_name
         product_name=$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo "")
 
-        if [[ "$product_name" == *"Amazon"* ]] || [[ -f /sys/hypervisor/uuid ]] && grep -qi "ec2" /sys/hypervisor/uuid 2>/dev/null; then
+        if [[ "$product_name" == *"Amazon"* ]] || { [[ -f /sys/hypervisor/uuid ]] && grep -qi "ec2" /sys/hypervisor/uuid 2>/dev/null; }; then
             is_cloud=true
             cloud_provider="AWS"
         elif [[ "$product_name" == *"Google"* ]]; then

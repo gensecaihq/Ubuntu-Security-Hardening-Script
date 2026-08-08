@@ -1,9 +1,10 @@
 #!/bin/bash
-# Ubuntu 25.x (25.04/25.10) Security Hardening Script - Production Grade
+# Ubuntu 26.04 LTS Security Hardening Script - Production Grade
 # GitHub: https://github.com/gensecaihq/Ubuntu-Security-Hardening-Script
 # License: MIT License
-# Version: 4.0
-# Optimized for Ubuntu 25.04 (Plucky Puffin) and 25.10 (Questing Quokka)
+# Version: 5.0
+# Optimized for Ubuntu 26.04 LTS (Resolute Raccoon) - released 23 April 2026
+# Supported until April 2031 (ESM until 2036 with Ubuntu Pro)
 
 # DISCLAIMER:
 # This script is provided "AS IS" without warranty of any kind, express or implied.
@@ -12,7 +13,7 @@
 # measures this script attempts to apply. By using this script, you agree that the
 # author shall not be held liable for any damages resulting from the use of this script.
 
-set -euo pipefail  # Exit on error, undefined variables, pipe failures
+set -eEuo pipefail  # Exit on error (-E: ERR trap fires inside functions too), undefined variables, pipe failures
 IFS=$'\n\t'       # Set secure Internal Field Separator
 
 # Color codes for output
@@ -24,19 +25,24 @@ readonly NC='\033[0m' # No Color
 
 # Global variables
 readonly SCRIPT_NAME=$(basename "$0")
-readonly SCRIPT_VERSION="4.0"
+readonly SCRIPT_VERSION="5.0"
 readonly LOG_DIR="/var/log/security-hardening"
 readonly LOG_FILE="${LOG_DIR}/hardening-$(date +%Y%m%d-%H%M%S).log"
 readonly BACKUP_DIR="/var/backups/security-hardening"
 readonly REPORT_FILE="${LOG_DIR}/hardening_report_$(date +%Y%m%d-%H%M%S).txt"
 
-# Ubuntu 25.x specific features
-readonly SUPPORTS_CHRONY_NTS=true          # Network Time Security enabled by default
-readonly SUPPORTS_SUDO_RS=true             # Rust implementation of sudo (25.10)
-readonly SUPPORTS_RUST_COREUTILS=true      # Rust coreutils (25.10)
-readonly SUPPORTS_INTEL_TDX=true           # Intel TDX for confidential computing (25.10)
-readonly SUPPORTS_CGROUP_V2_ONLY=true      # Cgroup v1 deprecated
-readonly KERNEL_VERSION_MIN="6.14"         # Minimum kernel for 25.04
+# Ubuntu 26.04 LTS target version and platform baseline
+readonly UBUNTU_VERSION="26.04"            # Target release (Resolute Raccoon)
+readonly KERNEL_VERSION_MIN="7.0"          # 26.04 GA kernel is Linux 7.0
+# 26.04 platform facts this script relies on:
+#   - sudo-rs 0.2.13 is the default sudo (traditional sudo available as 'sudo.ws')
+#   - ~80 coreutils are Rust (uutils); cp/mv/rm remain GNU
+#   - OpenSSL 3.5 with post-quantum defaults (ML-KEM/ML-DSA/SLH-DSA)
+#   - OpenSSH 10.2 (split sshd/sshd-auth/sshd-session, mlkem768x25519-sha256 kex)
+#   - systemd 259: cgroup v2 only, nftables-only firewall backend
+#   - AppArmor 5.0 (userns, io_uring, mqueue mediation)
+#   - auditd 4.1 (separate audit-rules.service and auditd.service)
+#   - Chrony 4.8 with NTS enabled by default (replaces systemd-timesyncd)
 
 # Function to print colored output with timestamp
 print_message() {
@@ -77,7 +83,7 @@ check_root() {
     fi
 }
 
-# Function to verify Ubuntu 25.x
+# Function to verify Ubuntu 26.04 LTS
 check_ubuntu_version() {
     if ! command -v lsb_release &> /dev/null; then
         error_exit "lsb_release not found. Is this Ubuntu?"
@@ -88,10 +94,13 @@ check_ubuntu_version() {
 
     print_message "$GREEN" "Detected Ubuntu version: $version ($codename)"
 
-    # Check for Ubuntu 25.04 or 25.10
-    if [[ ! "$version" =~ ^25\.(04|10)$ ]]; then
-        print_message "$YELLOW" "WARNING: This script is optimized for Ubuntu 25.04/25.10"
+    # Check for Ubuntu 26.04 LTS
+    if [[ "$version" != "$UBUNTU_VERSION" ]]; then
+        print_message "$YELLOW" "WARNING: This script is optimized for Ubuntu ${UBUNTU_VERSION} LTS (Resolute Raccoon)"
         print_message "$YELLOW" "Current version: $version"
+        if [[ ! -t 0 ]]; then
+            error_exit "Non-interactive session on unsupported version. Aborting for safety."
+        fi
         read -p "Do you want to continue? (y/N): " -n 1 -r
         echo
         if [[ ! $REPLY =~ ^[Yy]$ ]]; then
@@ -99,9 +108,12 @@ check_ubuntu_version() {
         fi
     fi
 
-    # Verify kernel version
+    # Verify kernel version (26.04 GA ships Linux 7.0)
     local kernel_version=$(uname -r | cut -d'-' -f1)
-    print_message "$BLUE" "Kernel version: $kernel_version"
+    print_message "$BLUE" "Kernel version: $kernel_version (expected ${KERNEL_VERSION_MIN}+ on ${UBUNTU_VERSION})"
+    if [[ "$(printf '%s\n' "$KERNEL_VERSION_MIN" "$kernel_version" | sort -V | head -n1)" != "$KERNEL_VERSION_MIN" ]]; then
+        print_message "$YELLOW" "WARNING: Kernel $kernel_version is older than expected ${KERNEL_VERSION_MIN}. Some hardening keys may not apply."
+    fi
 }
 
 # Function to check system requirements
@@ -125,11 +137,11 @@ check_system_requirements() {
         print_message "$YELLOW" "WARNING: Running in a container. Some features may not work."
     fi
 
-    # Check for cgroup v2 (required in Ubuntu 25.x)
+    # Check for cgroup v2 (required in Ubuntu 26.04 LTS)
     if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
-        print_message "$GREEN" "✓ Using cgroup v2 (recommended for Ubuntu 25.x)"
+        print_message "$GREEN" "✓ Using cgroup v2 (recommended for Ubuntu 26.04 LTS)"
     else
-        print_message "$YELLOW" "⚠ cgroup v2 not detected. This may cause issues with Ubuntu 25.x"
+        print_message "$YELLOW" "⚠ cgroup v2 not detected. This may cause issues with Ubuntu 26.04 LTS"
     fi
 }
 
@@ -178,7 +190,9 @@ detect_desktop_environment() {
     fi
 
     # Check for desktop packages
-    if dpkg -l 2>/dev/null | grep -qE "ubuntu-desktop|kubuntu-desktop|xubuntu-desktop|gnome-shell|kde-plasma-desktop"; then
+    # (grep without -q: -q exits early and can SIGPIPE dpkg under pipefail,
+    # misdetecting a desktop as a server and enforcing GUI-breaking profiles)
+    if dpkg -l 2>/dev/null | grep -E "ubuntu-desktop|kubuntu-desktop|xubuntu-desktop|gnome-shell|kde-plasma-desktop" > /dev/null; then
         echo "true"
         return
     fi
@@ -236,16 +250,16 @@ update_system() {
         -o Dpkg::Options::="--force-confold" || true
 }
 
-# Function to install required packages for Ubuntu 25.x
+# Function to install required packages for Ubuntu 26.04 LTS
 install_packages() {
-    print_message "$GREEN" "Installing security tools and packages for Ubuntu 25.x..."
+    print_message "$GREEN" "Installing security tools and packages for Ubuntu 26.04 LTS..."
 
-    # Core security packages for Ubuntu 25.x
+    # Core security packages for Ubuntu 26.04 LTS
     local packages=(
         # File integrity and monitoring
+        # (tripwire removed - unmaintained; AIDE is the supported FIM tool)
         "aide"
         "aide-common"
-        "tripwire"
 
         # Auditing and compliance
         "auditd"
@@ -297,10 +311,13 @@ install_packages() {
         "libpam-cap"
         "libpam-modules-bin"
 
-        # Cryptography (Ubuntu 25.x uses OpenSSL 3.4.1+, GnuTLS 3.8.9+)
+        # Cryptography (Ubuntu 26.04 LTS ships OpenSSL 3.5 with post-quantum
+        # ML-KEM/ML-DSA/SLH-DSA support; ecryptfs-utils removed - deprecated)
         "cryptsetup"
         "cryptsetup-initramfs"
-        "ecryptfs-utils"
+
+        # TPM tooling (TPM-backed full disk encryption is GA in 26.04)
+        "tpm2-tools"
 
         # SELinux tools (optional)
         "selinux-utils"
@@ -315,7 +332,7 @@ install_packages() {
         "sysstat"
         "acct"
 
-        # Ubuntu 25.x specific - Chrony with NTS
+        # Ubuntu 26.04 LTS specific - Chrony with NTS
         "chrony"
 
         # Ubuntu Pro tools
@@ -326,8 +343,9 @@ install_packages() {
         "systemd-homed"
     )
 
-    # Install OpenSCAP for Ubuntu 25.x
-    packages+=("libopenscap8" "openscap-scanner" "openscap-utils" "scap-security-guide")
+    # Install OpenSCAP for Ubuntu 26.04 LTS
+    # (libopenscap8 no longer exists; the scanner packages pull the current library)
+    packages+=("openscap-scanner" "openscap-utils" "scap-security-guide")
 
     # Install packages with error handling
     for package in "${packages[@]}"; do
@@ -338,14 +356,14 @@ install_packages() {
     done
 
     # Enable additional Ubuntu Pro features if available
-    if command -v pro &> /dev/null && pro status | grep -q "entitled"; then
+    if command -v pro &> /dev/null && pro status 2>/dev/null | grep -iE "entitled|enabled" > /dev/null; then
         print_message "$BLUE" "Enabling Ubuntu Pro security features..."
         pro enable usg || true
         pro enable cis || true
     fi
 }
 
-# Function to configure Chrony with Network Time Security (Ubuntu 25.x default)
+# Function to configure Chrony with Network Time Security (Ubuntu 26.04 LTS default)
 configure_chrony_nts() {
     print_message "$GREEN" "Configuring Chrony with Network Time Security (NTS)..."
 
@@ -356,9 +374,9 @@ configure_chrony_nts() {
 
     backup_file "/etc/chrony/chrony.conf"
 
-    # Configure Chrony with NTS enabled (Ubuntu 25.x default)
+    # Configure Chrony with NTS enabled (Ubuntu 26.04 LTS default)
     cat > /etc/chrony/chrony.conf << 'EOF'
-# Ubuntu 25.x Chrony Configuration with Network Time Security (NTS)
+# Ubuntu 26.04 LTS Chrony Configuration with Network Time Security (NTS)
 
 # NTS-enabled time servers
 server time.cloudflare.com iburst nts
@@ -396,17 +414,24 @@ cmdport 0
 
 # NTS security
 ntsdumpdir /var/lib/chrony
+# (nocerttimecheck deliberately NOT set - it disables TLS certificate time
+# validation and weakens NTS; only needed on RTC-less embedded devices)
 
 # Disable NTP authentication (using NTS instead)
 EOF
 
-    # Restart and enable chrony
-    systemctl restart chrony
-    systemctl enable chrony
+    # Restart and enable chrony (guarded - package install is best-effort)
+    if systemctl list-unit-files | grep '^chrony\.service' > /dev/null; then
+        systemctl restart chrony || print_message "$YELLOW" "WARNING: chrony failed to restart - check 'journalctl -u chrony'"
+        systemctl enable chrony || true
+    else
+        print_message "$YELLOW" "WARNING: chrony service not found, skipping restart"
+        return
+    fi
 
     # Verify NTS is working
     sleep 2
-    if chronyc -n sources | grep -q "\^*"; then
+    if chronyc -n sources 2>/dev/null | grep '\^\*' > /dev/null; then
         print_message "$GREEN" "✓ Chrony NTS configured successfully"
     else
         print_message "$YELLOW" "⚠ Chrony configured but NTS sources not yet synced (may take time)"
@@ -417,16 +442,17 @@ EOF
     systemctl disable systemd-timesyncd 2>/dev/null || true
 }
 
-# Function to configure AIDE with Ubuntu 25.x optimizations
+# Function to configure AIDE with Ubuntu 26.04 LTS optimizations
 configure_aide() {
     print_message "$GREEN" "Configuring AIDE file integrity checker..."
 
     backup_file "/etc/aide/aide.conf"
 
-    # Configure AIDE for Ubuntu 25.x
+    # Configure AIDE for Ubuntu 26.04 LTS (idempotent - skip if already applied)
+    if ! grep -q "# Ubuntu 26.04 LTS specific exclusions" /etc/aide/aide.conf 2>/dev/null; then
     cat >> /etc/aide/aide.conf << 'EOF'
 
-# Ubuntu 25.x specific exclusions
+# Ubuntu 26.04 LTS specific exclusions
 !/snap/
 !/var/snap/
 !/var/lib/snapd/
@@ -441,10 +467,16 @@ configure_aide() {
 !/var/lib/lxd/
 !/var/lib/chrony/
 EOF
+    fi
 
-    # Initialize AIDE database
+    # Initialize AIDE database (warn, don't abort - the rest of the hardening
+    # must still run even if AIDE initialization fails)
     print_message "$GREEN" "Initializing AIDE database (this may take several minutes)..."
-    aideinit || error_exit "Failed to initialize AIDE"
+    if ! command -v aideinit &> /dev/null; then
+        print_message "$YELLOW" "WARNING: AIDE not installed, skipping file integrity configuration"
+        return
+    fi
+    aideinit || { print_message "$YELLOW" "WARNING: AIDE database initialization failed"; return; }
 
     # Move database to production location
     if [[ -f /var/lib/aide/aide.db.new ]]; then
@@ -490,16 +522,16 @@ EOF
     systemctl start aide-check.timer
 }
 
-# Function to configure Auditd with Ubuntu 25.x enhancements
+# Function to configure Auditd with Ubuntu 26.04 LTS enhancements
 configure_auditd() {
-    print_message "$GREEN" "Configuring auditd with Ubuntu 25.x optimizations..."
+    print_message "$GREEN" "Configuring auditd with Ubuntu 26.04 LTS optimizations..."
 
     backup_file "/etc/audit/auditd.conf"
     backup_file "/etc/audit/rules.d/audit.rules"
 
-    # Configure auditd for Ubuntu 25.x
+    # Configure auditd for Ubuntu 26.04 LTS
     cat > /etc/audit/auditd.conf << 'EOF'
-# Ubuntu 25.x Optimized Audit Configuration
+# Ubuntu 26.04 LTS Optimized Audit Configuration
 local_events = yes
 write_logs = yes
 log_file = /var/log/audit/audit.log
@@ -511,7 +543,6 @@ max_log_file = 8
 num_logs = 5
 priority_boost = 4
 disp_qos = lossy
-dispatcher = /sbin/audispd
 name_format = HOSTNAME
 max_log_file_action = ROTATE
 space_left = 75
@@ -522,6 +553,9 @@ admin_space_left = 50
 admin_space_left_action = SUSPEND
 disk_full_action = SUSPEND
 disk_error_action = SUSPEND
+# NOTE: no tcp_listen_port here - setting it would make auditd LISTEN on a
+# plaintext TCP port for remote audit records, an open network service this
+# hardening script must not create
 distribute_network = no
 q_depth = 1200
 overflow_action = SYSLOG
@@ -530,13 +564,13 @@ plugin_dir = /etc/audit/plugins.d
 end_of_event_timeout = 2
 EOF
 
-    # Create comprehensive audit rules for Ubuntu 25.x
+    # Create comprehensive audit rules for Ubuntu 26.04 LTS
     cat > /etc/audit/rules.d/hardening.rules << 'EOF'
-# Ubuntu 25.x Security Audit Rules
+# Ubuntu 26.04 LTS Security Audit Rules
 # Delete all existing rules
 -D
 
-# Buffer Size (increased for Ubuntu 25.x)
+# Buffer Size (increased for Ubuntu 26.04 LTS)
 -b 16384
 
 # Failure Mode
@@ -549,7 +583,8 @@ EOF
 -w /etc/gshadow -p wa -k identity
 -w /etc/security/opasswd -p wa -k identity
 
-# Monitor sudo configuration (including sudo-rs in 25.10)
+# Monitor sudo configuration (sudo-rs is the default sudo in 26.04;
+# it reads the same /etc/sudoers and /etc/sudoers.d/ files)
 -w /etc/sudoers -p wa -k sudoers
 -w /etc/sudoers.d/ -p wa -k sudoers
 
@@ -557,7 +592,7 @@ EOF
 -w /etc/ssh/sshd_config -p wa -k sshd_config
 -w /etc/ssh/sshd_config.d/ -p wa -k sshd_config
 
-# Monitor systemd (no UTMP in 25.x)
+# Monitor systemd (no UTMP since 25.x; systemd 259 in 26.04)
 -w /etc/systemd/ -p wa -k systemd
 -w /lib/systemd/ -p wa -k systemd
 
@@ -569,7 +604,7 @@ EOF
 -w /etc/apparmor.d/ -p wa -k apparmor
 -w /etc/apparmor/ -p wa -k apparmor
 
-# Monitor Chrony (Ubuntu 25.x time sync)
+# Monitor Chrony (Ubuntu 26.04 LTS time sync)
 -w /etc/chrony/chrony.conf -p wa -k time_config
 -w /etc/chrony/sources.d/ -p wa -k time_config
 
@@ -600,10 +635,10 @@ EOF
 -w /etc/hostname -p wa -k system-locale
 -w /etc/netplan/ -p wa -k network_config
 
-# Monitor login/logout events (no UTMP in Ubuntu 25.x)
+# Monitor login/logout events (no UTMP in Ubuntu 26.04 LTS;
+# tallylog removed - pam_tally is gone, pam_faillock is watched below)
 -w /var/log/faillog -p wa -k logins
 -w /var/log/lastlog -p wa -k logins
--w /var/log/tallylog -p wa -k logins
 -w /var/run/faillock/ -p wa -k logins
 
 # Monitor cron
@@ -677,9 +712,12 @@ EOF
 EOF
 
     # Load rules and restart auditd
-    augenrules --load
-    systemctl restart auditd
-    systemctl enable auditd
+    # auditd 4.1 (26.04) splits rule loading into audit-rules.service -
+    # both units must be enabled for a correct audit posture
+    augenrules --load || print_message "$YELLOW" "WARNING: augenrules --load reported errors (rules may need a reboot due to -e 2)"
+    systemctl restart auditd || print_message "$YELLOW" "WARNING: auditd restart failed (immutable mode requires reboot)"
+    systemctl enable auditd 2>/dev/null || print_message "$YELLOW" "WARNING: could not enable auditd"
+    systemctl enable audit-rules.service 2>/dev/null || true
 
     # Configure audit log rotation
     cat > /etc/logrotate.d/audit << 'EOF'
@@ -699,23 +737,24 @@ EOF
 EOF
 }
 
-# Function to configure AppArmor with Ubuntu 25.x profiles
+# Function to configure AppArmor with Ubuntu 26.04 LTS profiles
+# 26.04 ships AppArmor 5.0 with userns, io_uring and mqueue mediation
 # Fix for Issue #12: Desktop environment detection to prevent breaking GUI apps
 configure_apparmor() {
-    print_message "$GREEN" "Configuring AppArmor with Ubuntu 25.x profiles..."
+    print_message "$GREEN" "Configuring AppArmor 5.0 with Ubuntu 26.04 LTS profiles..."
 
     # Detect if running on desktop environment
     local is_desktop
     is_desktop=$(detect_desktop_environment)
 
     # Ensure AppArmor is enabled
-    systemctl enable apparmor
-    systemctl start apparmor
+    systemctl enable apparmor 2>/dev/null || print_message "$YELLOW" "WARNING: could not enable apparmor"
+    systemctl start apparmor 2>/dev/null || print_message "$YELLOW" "WARNING: could not start apparmor"
 
     # Set kernel parameter
     if ! grep -q "apparmor=1" /etc/default/grub; then
         sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="apparmor=1 security=apparmor /' /etc/default/grub
-        update-grub
+        update-grub || print_message "$YELLOW" "WARNING: update-grub failed (container/chroot?)"
     fi
 
     if [[ "$is_desktop" == "true" ]]; then
@@ -762,25 +801,27 @@ configure_apparmor() {
         print_message "$GREEN" "AppArmor profiles enforced"
     fi
 
-    # Configure snap confinement (Ubuntu 25.x enhanced)
+    # Configure snap confinement (Ubuntu 26.04 LTS enhanced)
     if command -v snap &> /dev/null; then
         print_message "$BLUE" "Configuring strict snap confinement..."
         snap set system experimental.parallel-instances=true 2>/dev/null || true
     fi
 }
 
-# Function to configure ClamAV with Ubuntu 25.x optimizations
+# Function to configure ClamAV with Ubuntu 26.04 LTS optimizations
 configure_clamav() {
     print_message "$GREEN" "Configuring ClamAV with performance optimizations..."
 
-    # Configure ClamAV for Ubuntu 25.x
+    # Configure ClamAV for Ubuntu 26.04 LTS
     backup_file "/etc/clamav/clamd.conf"
     backup_file "/etc/clamav/freshclam.conf"
 
-    # Optimize ClamAV configuration
+    # Optimize ClamAV configuration (idempotent - skip if already applied;
+    # duplicate appends silently override Debconf-managed values)
+    if ! grep -q "# Ubuntu 26.04 LTS Optimizations" /etc/clamav/clamd.conf 2>/dev/null; then
     cat >> /etc/clamav/clamd.conf << 'EOF'
 
-# Ubuntu 25.x Optimizations
+# Ubuntu 26.04 LTS Optimizations
 MaxThreads 4
 MaxDirectoryRecursion 20
 FollowDirectorySymlinks false
@@ -788,7 +829,7 @@ FollowFileSymlinks false
 CrossFilesystems false
 ScanPE true
 ScanELF true
-DetectBrokenExecutables true
+AlertBrokenExecutables true
 ScanOLE2 true
 ScanPDF true
 ScanSWF true
@@ -802,6 +843,7 @@ MaxFileSize 100M
 MaxRecursion 16
 MaxFiles 10000
 EOF
+    fi
 
     # Configure freshclam for automatic updates
     sed -i 's/^Checks.*/Checks 24/' /etc/clamav/freshclam.conf 2>/dev/null || true
@@ -814,15 +856,21 @@ EOF
     print_message "$GREEN" "Updating ClamAV virus database..."
     freshclam || print_message "$YELLOW" "WARNING: Failed to update ClamAV database"
 
-    # Start and enable services
+    # Start and enable services (guarded - clamav-daemon refuses to start until
+    # signature DB exists; a freshclam failure must not abort the whole run)
     systemctl start clamav-freshclam 2>/dev/null || print_message "$YELLOW" "WARNING: clamav-freshclam failed to start"
     systemctl start clamav-daemon 2>/dev/null || print_message "$YELLOW" "WARNING: clamav-daemon failed to start (signature DB may still be downloading)"
     systemctl enable clamav-freshclam 2>/dev/null || true
     systemctl enable clamav-daemon 2>/dev/null || true
 
-    # Get scan frequency
-    print_message "$GREEN" "Please enter how often you want ClamAV scans to run (daily/weekly/monthly):"
-    read -r scan_frequency
+    # Get scan frequency (defaults to weekly in non-interactive sessions)
+    if [[ -t 0 ]]; then
+        print_message "$GREEN" "Please enter how often you want ClamAV scans to run (daily/weekly/monthly):"
+        read -r scan_frequency
+    else
+        print_message "$YELLOW" "Non-interactive session: defaulting ClamAV scans to weekly"
+        scan_frequency="weekly"
+    fi
     scan_frequency=$(validate_frequency "$scan_frequency")
 
     # Create systemd timer for scans
@@ -861,7 +909,7 @@ nice -n 19 ionice -c 3 clamscan -r -i \
     --max-recursion=16 \
     --max-dir-recursion=20 \
     --log="$LOG_FILE" \
-    / 2>/dev/null
+    / 2>/dev/null || true   # clamscan exits 1 when infections are found - not a service failure
 
 # Send notification if infections found
 if grep -q "Infected files:" "$LOG_FILE" && grep -q "Infected files: [1-9]" "$LOG_FILE"; then
@@ -910,15 +958,15 @@ EOF
     print_message "$GREEN" "ClamAV configured with $scan_frequency scans"
 }
 
-# Function to configure automatic updates for Ubuntu 25.x
+# Function to configure automatic updates for Ubuntu 26.04 LTS
 configure_unattended_upgrades() {
-    print_message "$GREEN" "Configuring automatic security updates for Ubuntu 25.x..."
+    print_message "$GREEN" "Configuring automatic security updates for Ubuntu 26.04 LTS..."
 
     backup_file "/etc/apt/apt.conf.d/50unattended-upgrades"
 
-    # Configure unattended-upgrades for Ubuntu 25.x
+    # Configure unattended-upgrades for Ubuntu 26.04 LTS
     cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
-// Ubuntu 25.x Automatic Updates Configuration
+// Ubuntu 26.04 LTS Automatic Updates Configuration
 Unattended-Upgrade::Allowed-Origins {
         "${distro_id}:${distro_codename}";
         "${distro_id}:${distro_codename}-security";
@@ -950,7 +998,7 @@ Unattended-Upgrade::MailReport "on-change";
 // Do upgrade in minimal steps
 Unattended-Upgrade::MinimalSteps "true";
 
-// Ubuntu 25.x specific - enable Livepatch if available
+// Ubuntu 26.04 LTS specific - enable Livepatch if available
 Unattended-Upgrade::DevRelease "auto";
 EOF
 
@@ -964,7 +1012,7 @@ APT::Periodic::Verbose "1";
 EOF
 
     # Enable update-notifier for desktop systems (Fix for Issue #8)
-    if dpkg -l | grep -q "update-notifier"; then
+    if dpkg -l 2>/dev/null | grep "update-notifier" > /dev/null; then
         cat > /etc/apt/apt.conf.d/99update-notifier << 'EOF'
 DPkg::Post-Invoke { "if [ -d /var/lib/update-notifier ]; then touch /var/lib/update-notifier/dpkg-run-stamp; fi"; };
 EOF
@@ -980,11 +1028,11 @@ $nrconf{kernelhints} = 0;
 EOF
     fi
 
-    systemctl restart unattended-upgrades
-    systemctl enable unattended-upgrades
+    systemctl restart unattended-upgrades 2>/dev/null || print_message "$YELLOW" "WARNING: unattended-upgrades service restart failed"
+    systemctl enable unattended-upgrades 2>/dev/null || true
 }
 
-# Function to configure UFW with Ubuntu 25.x enhancements
+# Function to configure UFW with Ubuntu 26.04 LTS enhancements
 configure_ufw() {
     print_message "$GREEN" "Configuring UFW firewall with IPv6 support..."
 
@@ -999,8 +1047,13 @@ configure_ufw() {
     # Enable IPv6 support
     sed -i 's/IPV6=.*/IPV6=yes/' /etc/default/ufw
 
-    # Reset firewall to defaults
-    ufw --force reset
+    # Reset to defaults ONLY on first run - a reset on an already-hardened
+    # system would wipe every firewall rule the operator added since
+    if ufw status 2>/dev/null | grep "Status: active" > /dev/null; then
+        print_message "$YELLOW" "UFW already active - keeping existing rules, re-asserting baseline only"
+    else
+        ufw --force reset
+    fi
 
     # Set default policies
     ufw default deny incoming
@@ -1039,26 +1092,26 @@ EOF
 
     # Note: iptables-persistent removed to avoid conflicts (Fix for Issue #4)
     if command -v netfilter-persistent &> /dev/null; then
-        netfilter-persistent save
-        systemctl enable netfilter-persistent
+        netfilter-persistent save 2>/dev/null || true
+        systemctl enable netfilter-persistent 2>/dev/null || true
     fi
 
     print_message "$GREEN" "UFW firewall configured and enabled"
     print_message "$YELLOW" "NOTE: Only SSH (rate-limited) and DHCP are allowed"
 }
 
-# Function to configure Fail2ban with Ubuntu 25.x optimizations
+# Function to configure Fail2ban with Ubuntu 26.04 LTS optimizations
 # Fix: Made less aggressive to prevent locking out legitimate users
 configure_fail2ban() {
     print_message "$GREEN" "Configuring Fail2ban with systemd integration..."
 
     backup_file "/etc/fail2ban/jail.conf"
 
-    # Create jail.local with Ubuntu 25.x optimizations
+    # Create jail.local with Ubuntu 26.04 LTS optimizations
     # Fix: Increased maxretry and reduced initial bantime to prevent legitimate user lockouts
     cat > /etc/fail2ban/jail.local << 'EOF'
 [DEFAULT]
-# Ubuntu 25.x Fail2ban Configuration
+# Ubuntu 26.04 LTS Fail2ban Configuration
 # NOTE: Settings adjusted to prevent locking out legitimate users
 bantime  = 10m
 findtime  = 10m
@@ -1080,13 +1133,18 @@ destemail = root@localhost
 sender = root@localhost
 mta = sendmail
 
-# Action: ban only - action_mwl needs a working MTA + whois, which are not installed
+# Action: ban only. (action_mwl requires a working MTA + whois, which this
+# script does not install - with them missing it just logs action errors)
 action = %(action_)s
 
 # Ignore localhost and private networks
 # Add your CI/CD, monitoring, and trusted IPs here
 ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
 
+# SSH protection via systemd journal (fail2ban 1.x: the old sshd-ddos filter
+# was merged into the sshd filter; mode=aggressive covers ddos patterns too.
+# OpenSSH 10.2 splits sshd into sshd/sshd-auth/sshd-session - the systemd
+# backend follows the ssh.service journal, which covers all three.)
 [sshd]
 enabled = true
 mode = aggressive
@@ -1118,17 +1176,18 @@ failregex = .*UFW BLOCK.* SRC=<HOST>
 ignoreregex =
 EOF
 
-    # Restart fail2ban (guarded - a jail error must not abort the run)
-    systemctl restart fail2ban 2>/dev/null || print_message "$YELLOW" "WARNING: fail2ban restart failed"
+    # Restart fail2ban (guarded - a jail config error must not abort the run
+    # and leave SSH/kernel hardening unapplied)
+    systemctl restart fail2ban 2>/dev/null || print_message "$YELLOW" "WARNING: fail2ban restart failed - check 'fail2ban-client -t' and 'journalctl -u fail2ban'"
     systemctl enable fail2ban 2>/dev/null || true
 
     print_message "$GREEN" "Fail2ban configured with systemd integration"
 }
 
-# Function to harden SSH for Ubuntu 25.x
+# Function to harden SSH for Ubuntu 26.04 LTS
 # Fix: Check for SSH keys before disabling password authentication
 harden_ssh() {
-    print_message "$GREEN" "Hardening SSH configuration for Ubuntu 25.x..."
+    print_message "$GREEN" "Hardening SSH configuration for Ubuntu 26.04 LTS..."
 
     backup_file "/etc/ssh/sshd_config"
 
@@ -1149,13 +1208,18 @@ harden_ssh() {
         print_message "$RED" "║ 2. Keep password authentication enabled (less secure)        ║"
         print_message "$RED" "╚══════════════════════════════════════════════════════════════╝"
 
-        read -p "Keep password authentication enabled? (Y/n): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            print_message "$YELLOW" "Password authentication will remain ENABLED for safety"
+        if [[ ! -t 0 ]]; then
+            print_message "$YELLOW" "Non-interactive session: keeping password authentication ENABLED for safety"
             password_auth="yes"
         else
-            print_message "$RED" "Proceeding with password authentication DISABLED - ensure you have console access!"
+            read -p "Keep password authentication enabled? (Y/n): " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                print_message "$YELLOW" "Password authentication will remain ENABLED for safety"
+                password_auth="yes"
+            else
+                print_message "$RED" "Proceeding with password authentication DISABLED - ensure you have console access!"
+            fi
         fi
     else
         print_message "$GREEN" "SSH keys found. Safe to disable password authentication."
@@ -1164,15 +1228,14 @@ harden_ssh() {
     # Create hardened SSH config using Include directive
     mkdir -p /etc/ssh/sshd_config.d/
     cat > /etc/ssh/sshd_config.d/99-hardening.conf << EOF
-# Ubuntu 25.x SSH Hardening Configuration
-# Protocol and Network
-Protocol 2
+# Ubuntu 26.04 LTS SSH Hardening Configuration (OpenSSH 10.2)
+# Network
 Port 22
 AddressFamily any
 ListenAddress 0.0.0.0
 ListenAddress ::
 
-# Host Keys (Ubuntu 25.x defaults)
+# Host Keys (Ubuntu 26.04 LTS defaults - DSA is fully removed in OpenSSH 10)
 HostKey /etc/ssh/ssh_host_rsa_key
 HostKey /etc/ssh/ssh_host_ecdsa_key
 HostKey /etc/ssh/ssh_host_ed25519_key
@@ -1182,17 +1245,22 @@ PermitRootLogin no
 PubkeyAuthentication yes
 PasswordAuthentication ${password_auth}
 PermitEmptyPasswords no
-ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
 KerberosAuthentication no
 GSSAPIAuthentication no
 UsePAM yes
 MaxAuthTries 3
 MaxSessions 10
+
+# Built-in brute-force rate limiting (OpenSSH 9.8+, tightened in 10.x)
+PerSourcePenalties yes
 EOF
 
     # Add AuthenticationMethods based on password_auth setting.
-    # When keeping password auth the directive is OMITTED: "publickey,password"
-    # (comma) would require BOTH methods, locking out password-only users.
+    # CRITICAL: when keeping password auth, the directive must be OMITTED
+    # (or space-separated). "publickey,password" (comma) means BOTH methods
+    # required in sequence - a user with no key could never log in, defeating
+    # the entire no-keys safety fallback.
     if [[ "$password_auth" == "no" ]]; then
         echo "AuthenticationMethods publickey" >> /etc/ssh/sshd_config.d/99-hardening.conf
     fi
@@ -1218,10 +1286,12 @@ GatewayPorts no
 SyslogFacility AUTH
 LogLevel VERBOSE
 
-# Crypto (Ubuntu 25.x strong defaults with OpenSSL 3.4.1+)
+# Crypto (Ubuntu 26.04 LTS - OpenSSH 10.2 with post-quantum key exchange)
+# mlkem768x25519-sha256 (FIPS 203 ML-KEM hybrid) is the 26.04 default and
+# listed first; sntrup761 and classical ECDH kept for older clients
 Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com
-KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+KexAlgorithms mlkem768x25519-sha256,sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
 HostKeyAlgorithms ssh-ed25519,ssh-ed25519-cert-v01@openssh.com,rsa-sha2-512,rsa-sha2-256
 
 # Connection Settings
@@ -1253,7 +1323,7 @@ Subsystem sftp /usr/lib/openssh/sftp-server -f AUTHPRIV -l INFO
 # ============================================
 # FIDO2/WebAuthn Security Key Support
 # ============================================
-# Ubuntu 25.x has OpenSSH 9.x+ with full FIDO2 support
+# Ubuntu 26.04 LTS has OpenSSH 10.2 with full FIDO2 support
 PubkeyAcceptedAlgorithms +sk-ssh-ed25519@openssh.com,sk-ecdsa-sha2-nistp256@openssh.com,ssh-ed25519,rsa-sha2-512,rsa-sha2-256
 EOF
 
@@ -1274,9 +1344,6 @@ Generate FIDO2 key:
 Benefits: Hardware-backed, phishing resistant, requires physical touch
 CERTDOC
 
-    # Test configuration
-    sshd -t || error_exit "SSH configuration test failed"
-
     # Create SSH banner
     cat > /etc/issue.net << 'EOF'
 ********************************************************************************
@@ -1289,8 +1356,10 @@ EOF
     # Update main sshd_config to use banner
     echo "Banner /etc/issue.net" >> /etc/ssh/sshd_config.d/99-hardening.conf
 
-    # Restart SSH service
-    systemctl restart sshd
+    # Test the FINAL configuration (after every line has been written),
+    # then restart (unit is ssh.service on Ubuntu; sshd is an alias)
+    sshd -t || error_exit "SSH configuration test failed - NOT restarting sshd; existing sessions are safe"
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd
 
     print_message "$GREEN" "SSH hardened successfully"
     if [[ "$password_auth" == "yes" ]]; then
@@ -1301,19 +1370,21 @@ EOF
     fi
 }
 
-# Function to configure system limits for Ubuntu 25.x
+# Function to configure system limits for Ubuntu 26.04 LTS
 # Fix: Increased limits to support production workloads without breaking services
 configure_limits() {
     print_message "$GREEN" "Configuring system security limits..."
 
     backup_file "/etc/security/limits.conf"
 
-    # Add security limits
+    # Add security limits (idempotent - pam_limits is last-match-wins, but
+    # repeated appends grow the file unboundedly on reruns)
     # NOTE: Limits increased from original values to support production workloads
     # Original: nproc 512/1024, maxlogins 10 - too restrictive for many use cases
+    if ! grep -q "# Ubuntu 26.04 LTS Security Limits" /etc/security/limits.conf 2>/dev/null; then
     cat >> /etc/security/limits.conf << 'EOF'
 
-# Ubuntu 25.x Security Limits (Production-ready values)
+# Ubuntu 26.04 LTS Security Limits (Production-ready values)
 # Disable core dumps (security - prevents sensitive data leakage)
 * soft core 0
 * hard core 0
@@ -1358,12 +1429,13 @@ root hard nproc unlimited
 * soft maxsyslogins 20
 * hard maxsyslogins 20
 EOF
+    fi
 
     # Configure systemd limits (production-ready values)
     mkdir -p /etc/systemd/system.conf.d/
     cat > /etc/systemd/system.conf.d/99-limits.conf << 'EOF'
 [Manager]
-# Ubuntu 25.x Systemd Limits (Production-ready)
+# Ubuntu 26.04 LTS Systemd Limits (Production-ready)
 DefaultLimitCORE=0
 DefaultLimitNOFILE=65536:65536
 DefaultLimitNPROC=4096:8192
@@ -1375,15 +1447,15 @@ EOF
     systemctl daemon-reload
 }
 
-# Function to configure kernel parameters for Ubuntu 25.x
+# Function to configure kernel parameters for Ubuntu 26.04 LTS
 configure_sysctl() {
-    print_message "$GREEN" "Configuring kernel security parameters for Ubuntu 25.x..."
+    print_message "$GREEN" "Configuring kernel security parameters for Ubuntu 26.04 LTS..."
 
     backup_file "/etc/sysctl.conf"
 
     # Create comprehensive sysctl security configuration
     cat > /etc/sysctl.d/99-security-hardening.conf << 'EOF'
-# Ubuntu 25.x Kernel Security Hardening (Kernel 6.14+/6.17+)
+# Ubuntu 26.04 LTS Kernel Security Hardening (Linux 7.0)
 
 ### Network Security ###
 
@@ -1423,7 +1495,9 @@ net.ipv4.tcp_max_syn_backlog = 2048
 net.ipv4.tcp_synack_retries = 2
 net.ipv4.tcp_syn_retries = 5
 
-# TCP timestamps stay enabled (disabling breaks PAWS; uptime leak moot since kernel 4.10)
+# TCP timestamps stay ENABLED: disabling them breaks PAWS protection and RTT
+# estimation, and the uptime-leak concern is moot since kernel 4.10 randomized
+# per-connection timestamp offsets
 net.ipv4.tcp_timestamps = 1
 
 # Enable TCP RFC 1337
@@ -1454,7 +1528,7 @@ kernel.yama.ptrace_scope = 2
 # Disable kexec
 kernel.kexec_load_disabled = 1
 
-# Harden BPF JIT (Ubuntu 25.x with eBPF improvements)
+# Harden BPF JIT (Ubuntu 26.04 LTS with eBPF improvements)
 net.core.bpf_jit_harden = 2
 
 # Restrict performance events
@@ -1472,16 +1546,18 @@ fs.protected_symlinks = 1
 fs.protected_regular = 2
 fs.protected_fifos = 2
 
-# Restrict unprivileged userns (Ubuntu 25.x cgroup v2)
-kernel.unprivileged_userns_clone = 0
+# Restrict unprivileged user namespaces via AppArmor 5.0 mediation
+# (kernel.unprivileged_userns_clone is a Debian patch that no longer exists;
+# Ubuntu 24.04+ uses the AppArmor-based controls below instead)
+kernel.apparmor_restrict_unprivileged_userns = 1
+kernel.apparmor_restrict_unprivileged_unconfined = 1
 
-# Ubuntu 25.x specific (Kernel 6.14+/6.17+)
+# Ubuntu 26.04 LTS specific (Linux 7.0)
 kernel.unprivileged_bpf_disabled = 1
 net.core.bpf_jit_enable = 0
-kernel.modules_disabled = 0
 kernel.io_uring_disabled = 2
 
-# Enhanced security for io_uring (Kernel 6.14+)
+# Enhanced security for io_uring (also mediated by AppArmor 5.0 in 26.04)
 kernel.io_uring_group = -1
 
 ### Performance and Resource Protection ###
@@ -1497,9 +1573,10 @@ fs.file-max = 65536
 kernel.printk = 3 3 3 3
 EOF
 
-    # Apply sysctl settings
+    # Apply sysctl settings (sysctl continues past unknown keys but returns
+    # non-zero; don't let a single missing key abort the whole run under set -e)
     if ! sysctl -p /etc/sysctl.d/99-security-hardening.conf; then
-        print_message "$YELLOW" "WARNING: some sysctl keys were not applied (not available on this kernel)"
+        print_message "$YELLOW" "WARNING: Some sysctl keys were not applied (not available on this kernel)"
     fi
 
     print_message "$GREEN" "Kernel parameters configured"
@@ -1542,7 +1619,7 @@ configure_kernel_lockdown() {
             fi
 
             if command -v update-grub &> /dev/null; then
-                update-grub
+                update-grub || print_message "$YELLOW" "WARNING: update-grub failed (container/chroot?)"
                 print_message "$GREEN" "GRUB updated with kernel lockdown=integrity"
                 print_message "$YELLOW" "NOTE: Reboot required to enable kernel lockdown"
             fi
@@ -1567,35 +1644,55 @@ EOF
     print_message "$GREEN" "Kernel lockdown configuration completed"
 }
 
-# Function to configure OpenSCAP for Ubuntu 25.x
+# Function to configure OpenSCAP for Ubuntu 26.04 LTS
 configure_openscap() {
     if ! command -v oscap &> /dev/null; then
         print_message "$YELLOW" "OpenSCAP not available, skipping configuration"
         return
     fi
 
-    print_message "$GREEN" "Configuring OpenSCAP for Ubuntu 25.x..."
+    print_message "$GREEN" "Configuring OpenSCAP for Ubuntu 26.04 LTS..."
 
-    # Get scan frequency
-    print_message "$GREEN" "Please enter how often you want OpenSCAP scans to run (daily/weekly/monthly):"
-    read -r oscap_frequency
+    # Get scan frequency (defaults to weekly in non-interactive sessions)
+    if [[ -t 0 ]]; then
+        print_message "$GREEN" "Please enter how often you want OpenSCAP scans to run (daily/weekly/monthly):"
+        read -r oscap_frequency
+    else
+        print_message "$YELLOW" "Non-interactive session: defaulting OpenSCAP scans to weekly"
+        oscap_frequency="weekly"
+    fi
     oscap_frequency=$(validate_frequency "$oscap_frequency")
 
-    # Find the appropriate SCAP content
-    local ssg_file="/usr/share/xml/scap/ssg/content/ssg-ubuntu2404-ds.xml"
-    if [[ ! -f "$ssg_file" ]]; then
-        ssg_file="/usr/share/openscap/ssg/ssg-ubuntu2404-ds.xml"
+    # Find the appropriate SCAP content - prefer the 26.04 datastream, fall
+    # back to the newest available Ubuntu datastream if 2604 isn't shipped yet
+    local ssg_file=""
+    local candidate
+    for candidate in \
+        /usr/share/xml/scap/ssg/content/ssg-ubuntu2604-ds.xml \
+        /usr/share/openscap/ssg/ssg-ubuntu2604-ds.xml; do
+        if [[ -f "$candidate" ]]; then
+            ssg_file="$candidate"
+            break
+        fi
+    done
+
+    if [[ -z "$ssg_file" ]]; then
+        ssg_file=$(ls -1 /usr/share/xml/scap/ssg/content/ssg-ubuntu*-ds.xml 2>/dev/null | sort -V | tail -1 || true)
+        if [[ -n "$ssg_file" ]]; then
+            print_message "$YELLOW" "NOTE: ssg-ubuntu2604 content not found; using $(basename "$ssg_file") instead"
+        fi
     fi
 
-    if [[ ! -f "$ssg_file" ]]; then
+    if [[ -z "$ssg_file" || ! -f "$ssg_file" ]]; then
         print_message "$YELLOW" "WARNING: SCAP Security Guide content not found"
+        print_message "$YELLOW" "TIP: On Ubuntu Pro, 'pro enable usg' provides certified CIS/DISA-STIG content via the 'usg' tool"
         return
     fi
 
     # Create scan script
     cat > /usr/local/bin/openscap-scan.sh << EOF
 #!/bin/bash
-# OpenSCAP Security Compliance Scan for Ubuntu 25.x
+# OpenSCAP Security Compliance Scan for Ubuntu 26.04 LTS
 # Supports CIS Benchmarks and DISA STIG profiles
 
 REPORT_DIR="/var/log/openscap"
@@ -1623,11 +1720,15 @@ oscap xccdf eval \\
     --fetch-remote-resources \\
     "$ssg_file" 2>&1 | tee "\$REPORT_DIR/scan_\$(date +%Y%m%d-%H%M%S).log"
 
-# Generate remediation script
-oscap xccdf generate fix \\
-    --profile "\$PROFILE" \\
-    --output "\$REPORT_DIR/remediation_\$(date +%Y%m%d-%H%M%S).sh" \\
-    "\$REPORT_DIR"/results_*.xml | tail -1
+# Generate remediation script from the NEWEST results file
+# (oscap takes exactly one input; a glob breaks from the second scan onward)
+LATEST_RESULTS=\$(ls -t "\$REPORT_DIR"/results_*.xml 2>/dev/null | head -1)
+if [ -n "\$LATEST_RESULTS" ]; then
+    oscap xccdf generate fix \\
+        --profile "\$PROFILE" \\
+        --output "\$REPORT_DIR/remediation_\$(date +%Y%m%d-%H%M%S).sh" \\
+        "\$LATEST_RESULTS"
+fi
 
 echo ""
 echo "Scan complete. Reports saved to: \$REPORT_DIR"
@@ -1687,43 +1788,62 @@ EOF
     print_message "$GREEN" "OpenSCAP configured with $oscap_frequency scans"
 }
 
-# Function to configure Ubuntu 25.x specific security features
-configure_ubuntu_25_features() {
-    print_message "$GREEN" "Configuring Ubuntu 25.x specific security features..."
+# Function to configure Ubuntu 26.04 LTS specific security features
+configure_ubuntu_26_features() {
+    print_message "$GREEN" "Configuring Ubuntu 26.04 LTS specific security features..."
+
+    # Report memory-safe system components (26.04 defaults)
+    if command -v sudo &>/dev/null && sudo --version 2>/dev/null | head -1 | grep -qi "sudo-rs"; then
+        print_message "$GREEN" "✓ sudo-rs (memory-safe Rust sudo) is active"
+        print_message "$BLUE" "  Traditional sudo remains available via the 'sudo.ws' package if needed"
+    else
+        print_message "$YELLOW" "⚠ Traditional C sudo detected (26.04 default is sudo-rs)"
+    fi
+
+    if dpkg -l rust-coreutils 2>/dev/null | grep -q '^ii'; then
+        print_message "$GREEN" "✓ Rust coreutils (uutils) active (~80 utilities; cp/mv/rm remain GNU)"
+        print_message "$BLUE" "  GNU versions reachable via gnu-prefixed names (gnucp, gnudate, ...)"
+    fi
 
     # Configure systemd security features
     print_message "$BLUE" "Configuring systemd security features..."
 
     # Enable systemd-oomd (Out of Memory Daemon)
-    if systemctl list-unit-files | grep -q systemd-oomd; then
-        systemctl enable systemd-oomd
-        systemctl start systemd-oomd
+    if systemctl list-unit-files | grep systemd-oomd > /dev/null; then
+        systemctl enable systemd-oomd 2>/dev/null || true
+        systemctl start systemd-oomd 2>/dev/null || true
     fi
 
     # Configure enhanced systemd service sandboxing
     print_message "$BLUE" "Applying enhanced systemd service sandboxing..."
 
-    # NOTE: no sandbox drop-in for ssh.service - sshd spawns user sessions
-    # that inherit ProtectSystem/ProtectHome/NoNewPrivileges, which gives
-    # users a read-only filesystem and breaks sudo/su/passwd.
+    # NOTE: NO sandbox drop-in for ssh.service. sshd spawns interactive user
+    # sessions that inherit its mount/no_new_privs state - ProtectSystem/
+    # ProtectHome/PrivateTmp/NoNewPrivileges on sshd give every SSH user a
+    # read-only filesystem, an isolated /tmp, and broken sudo/su/passwd.
+    # Remove any such drop-in left behind by earlier script versions:
+    if [[ -f /etc/systemd/system/ssh.service.d/hardening.conf ]]; then
+        rm -f /etc/systemd/system/ssh.service.d/hardening.conf
+        print_message "$YELLOW" "Removed unsafe ssh.service sandbox drop-in from a previous run"
+    fi
 
     # Fail2ban service hardening
+    # (ProtectSystem=full, NOT strict: fail2ban writes /run/fail2ban and its
+    # sqlite DB in /var/lib/fail2ban; strict makes both read-only.
+    # No NoNewPrivileges/CapabilityBoundingSet: fail2ban must run
+    # iptables/nft ban actions with full net-admin privileges.)
     mkdir -p /etc/systemd/system/fail2ban.service.d/
     cat > /etc/systemd/system/fail2ban.service.d/hardening.conf << 'EOF'
 [Service]
-ProtectSystem=strict
+ProtectSystem=full
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
-ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
-NoNewPrivileges=yes
-RestrictNamespaces=yes
 RestrictRealtime=yes
 LockPersonality=yes
-CapabilityBoundingSet=CAP_AUDIT_READ CAP_DAC_READ_SEARCH CAP_NET_ADMIN CAP_NET_RAW
 EOF
 
     # ClamAV service hardening
@@ -1741,20 +1861,21 @@ NoNewPrivileges=yes
 RestrictRealtime=yes
 EOF
 
-    # Chrony service hardening (Ubuntu 25.x uses Chrony)
+    # Chrony service hardening (Ubuntu 26.04 LTS uses Chrony)
+    # (ProtectSystem=full + ReadWritePaths: chronyd writes its drift file,
+    # NTS cookie cache and logs. No CapabilityBoundingSet: chronyd needs
+    # CAP_SETUID/CAP_SETGID to drop privileges to _chrony, plus CAP_SYS_TIME;
+    # Ubuntu's stock unit already scopes capabilities correctly.)
     mkdir -p /etc/systemd/system/chrony.service.d/
     cat > /etc/systemd/system/chrony.service.d/hardening.conf << 'EOF'
 [Service]
-ProtectSystem=strict
+ProtectSystem=full
 ProtectHome=yes
 PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-NoNewPrivileges=yes
 RestrictRealtime=yes
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SYS_TIME
+ReadWritePaths=/var/lib/chrony /var/log/chrony /run/chrony
 EOF
 
     # Auditd service hardening
@@ -1782,7 +1903,7 @@ DNSStubListener=yes
 DNSSEC=allow-downgrade
 DNSOverTLS=opportunistic
 EOF
-        systemctl restart systemd-resolved
+        systemctl restart systemd-resolved 2>/dev/null || print_message "$YELLOW" "WARNING: systemd-resolved restart failed"
     fi
 
     # Configure snap security
@@ -1797,10 +1918,19 @@ EOF
         chmod 600 /etc/netplan/*.yaml 2>/dev/null || true
     fi
 
-    # Check for Intel TDX support (Ubuntu 25.10+)
+    # Check for confidential computing support
+    # (26.04 has host and guest support for Intel TDX and AMD SEV-SNP)
     if [[ -d /sys/firmware/tdx ]] || grep -q tdx /proc/cpuinfo 2>/dev/null; then
         print_message "$GREEN" "✓ Intel TDX (Trust Domain Extensions) detected"
         print_message "$BLUE" "System supports confidential computing with hardware isolation"
+    fi
+    if grep -q sev_snp /proc/cpuinfo 2>/dev/null || [[ -e /dev/sev-guest ]]; then
+        print_message "$GREEN" "✓ AMD SEV-SNP support detected"
+    fi
+
+    # TPM-backed full disk encryption is GA in the 26.04 installer; report TPM status
+    if [[ -e /dev/tpmrm0 || -e /dev/tpm0 ]]; then
+        print_message "$GREEN" "✓ TPM device present - TPM-backed FDE and measured boot available"
     fi
 
     # Configure cgroup v2 settings
@@ -1829,6 +1959,8 @@ configure_cloud_security() {
         local product_name
         product_name=$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo "")
 
+        # (braces required: || and && have equal precedence in bash - without
+        # them Nitro instances with "Amazon EC2" in product_name are missed)
         if [[ "$product_name" == *"Amazon"* ]] || { [[ -f /sys/hypervisor/uuid ]] && grep -qi "ec2" /sys/hypervisor/uuid 2>/dev/null; }; then
             is_cloud=true
             cloud_provider="AWS"
@@ -1854,44 +1986,42 @@ configure_cloud_security() {
 
     print_message "$BLUE" "Detected cloud provider: $cloud_provider"
 
-    # AWS-specific hardening
-    if [[ "$cloud_provider" == "AWS" ]]; then
-        print_message "$BLUE" "Applying AWS-specific security controls..."
+    # Metadata service (IMDS) protection - all providers use 169.254.169.254.
+    # Installed as a systemd oneshot so it survives reboots (ifupdown
+    # /etc/network/if-up.d hooks never run under netplan/systemd-networkd).
+    if command -v iptables &> /dev/null; then
+        print_message "$BLUE" "Applying $cloud_provider metadata (IMDS) protection..."
 
-        # IMDSv2 enforcement - block IMDSv1 at firewall level
-        if command -v iptables &> /dev/null; then
-            cat > /etc/network/if-up.d/block-imds << 'IMDSEOF'
+        cat > /usr/local/sbin/imds-protection.sh << 'IMDSEOF'
 #!/bin/bash
-# Block direct access to IMDS for non-root users (defense against SSRF)
+# Block direct access to the cloud metadata service for non-root users
+# (defense against SSRF credential theft). Idempotent.
 iptables -C OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j DROP 2>/dev/null || \
     iptables -A OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j DROP
 iptables -C OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j LOG --log-prefix "IMDS-ACCESS: " 2>/dev/null || \
     iptables -I OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j LOG --log-prefix "IMDS-ACCESS: "
 IMDSEOF
-            chmod +x /etc/network/if-up.d/block-imds
-            /etc/network/if-up.d/block-imds 2>/dev/null || true
-        fi
-        print_message "$GREEN" "AWS IMDS protection configured"
-    fi
+        chmod 755 /usr/local/sbin/imds-protection.sh
 
-    # Azure-specific hardening
-    if [[ "$cloud_provider" == "Azure" ]]; then
-        print_message "$BLUE" "Applying Azure-specific security controls..."
-        if command -v iptables &> /dev/null; then
-            iptables -C OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j DROP 2>/dev/null || \
-                iptables -A OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j DROP
-        fi
-        print_message "$GREEN" "Azure metadata protection configured"
-    fi
+        cat > /etc/systemd/system/imds-protection.service << 'EOF'
+[Unit]
+Description=Restrict cloud metadata service (IMDS) access to root
+After=network-pre.target
+Before=network-online.target
 
-    # GCP-specific hardening
-    if [[ "$cloud_provider" == "GCP" ]]; then
-        print_message "$BLUE" "Applying GCP-specific security controls..."
-        if command -v iptables &> /dev/null; then
-            iptables -C OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j DROP 2>/dev/null || \
-                iptables -A OUTPUT -d 169.254.169.254 -m owner ! --uid-owner 0 -j DROP
-        fi
-        print_message "$GREEN" "GCP metadata protection configured"
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/imds-protection.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable imds-protection.service 2>/dev/null || true
+        /usr/local/sbin/imds-protection.sh 2>/dev/null || true
+
+        print_message "$GREEN" "$cloud_provider metadata protection configured (persistent)"
     fi
 
     # Universal cloud hardening
@@ -1962,15 +2092,19 @@ generate_compliance_json() {
   "compliance_report": {
     "timestamp": "$(date -Iseconds)",
     "hostname": "$(hostname)",
-    "os_version": "$(lsb_release -ds 2>/dev/null || echo 'Ubuntu 25.x')",
+    "os_version": "$(lsb_release -ds 2>/dev/null || echo 'Ubuntu 26.04 LTS')",
     "kernel": "$(uname -r)",
     "script_version": "$SCRIPT_VERSION",
-    "hardening_profile": "CIS Level 1 + Ubuntu 25.x Enhanced",
+    "hardening_profile": "CIS Level 1 + Ubuntu 26.04 LTS Enhanced",
     "controls_applied": {
-      "nts_time_sync": "enabled (chrony)",
-      "cgroup_v2": "exclusive",
+      "nts_time_sync": "enabled (chrony 4.8)",
+      "cgroup_v2": "exclusive (systemd 259)",
       "ebpf_hardening": "enhanced",
       "io_uring_restricted": true,
+      "post_quantum_ssh_kex": "mlkem768x25519-sha256",
+      "post_quantum_tls": "OpenSSL 3.5 (ML-KEM/ML-DSA/SLH-DSA)",
+      "memory_safe_sudo": "$(sudo --version 2>/dev/null | head -1 | grep -qi 'sudo-rs' && echo 'sudo-rs' || echo 'traditional sudo')",
+      "apparmor_userns_restriction": "enabled",
       "kernel_lockdown": "$(cat /sys/kernel/security/lockdown 2>/dev/null | grep -oP '\[\K[^\]]+' || echo 'none')",
       "systemd_sandboxing": "enabled",
       "lotl_detection": "enabled",
@@ -1997,7 +2131,7 @@ generate_report() {
     local ubuntu_ver=$(lsb_release -ds)
 
     cat > "$REPORT_FILE" << EOF
-Ubuntu 25.x Security Hardening Report
+Ubuntu 26.04 LTS Security Hardening Report
 ======================================
 Generated: $(date)
 Hostname: $(hostname)
@@ -2007,18 +2141,20 @@ Script Version: $SCRIPT_VERSION
 
 Executive Summary
 -----------------
-This system has been hardened according to security best practices for Ubuntu 25.x.
+This system has been hardened according to security best practices for Ubuntu 26.04 LTS.
 All security tools have been installed and configured with appropriate policies.
 
-Ubuntu 25.x Specific Features Applied
+Ubuntu 26.04 LTS Specific Features Applied
 --------------------------------------
 ✓ Chrony with Network Time Security (NTS) configured
 ✓ Cgroup v2 resource controls enabled
-✓ OpenSSL 3.4.1+ and GnuTLS 3.8.9+ cryptographic libraries
-✓ Enhanced AppArmor profiles for Ubuntu 25.x
-✓ Kernel 6.14+/6.17+ hardening parameters
-✓ Systemd security enhancements (no UTMP)
-✓ Enhanced eBPF security controls
+✓ OpenSSL 3.5 with post-quantum cryptography (ML-KEM/ML-DSA/SLH-DSA)
+✓ OpenSSH 10.2 with hybrid post-quantum key exchange (mlkem768x25519)
+✓ sudo-rs and Rust coreutils (memory-safe system components)
+✓ AppArmor 5.0 profiles (userns/io_uring/mqueue mediation)
+✓ Linux 7.0 kernel hardening parameters
+✓ Systemd 259 security enhancements (cgroup v2 only, no UTMP)
+✓ Enhanced eBPF security controls (BPF tokens)
 
 Applied Security Measures
 -------------------------
@@ -2038,20 +2174,20 @@ Applied Security Measures
 3. FILE INTEGRITY MONITORING
    ✓ AIDE configured with systemd timer
    ✓ Daily integrity checks scheduled
-   ✓ Ubuntu 25.x paths included
+   ✓ Ubuntu 26.04 LTS paths included
    ✓ Database location: /var/lib/aide/aide.db
 
 4. AUDIT SYSTEM
    ✓ Auditd configured with comprehensive ruleset
    ✓ Monitoring: auth, sudo, SSH, systemd, kernel modules
-   ✓ Ubuntu 25.x specific paths included (no UTMP)
+   ✓ Ubuntu 26.04 LTS specific paths included (no UTMP)
    ✓ Log rotation configured
 
 5. MANDATORY ACCESS CONTROL
    ✓ AppArmor enabled and enforcing
    ✓ All profiles in enforce mode
    ✓ Snap confinement configured
-   ✓ Ubuntu 25.x profiles applied
+   ✓ Ubuntu 26.04 LTS profiles applied
 
 6. ANTIVIRUS PROTECTION
    ✓ ClamAV installed and configured
@@ -2075,11 +2211,11 @@ Applied Security Measures
 9. SSH HARDENING
    ✓ Root login disabled
    ✓ Password authentication disabled
-   ✓ Strong crypto algorithms (OpenSSL 3.4.1+)
+   ✓ Strong crypto with post-quantum key exchange (OpenSSH 10.2)
    ✓ Connection limits configured
 
 10. KERNEL HARDENING
-    ✓ Sysctl parameters optimized for 6.14+/6.17+
+    ✓ Sysctl parameters optimized for Linux 7.0
     ✓ ASLR enabled
     ✓ Core dumps restricted
     ✓ Enhanced eBPF security
@@ -2181,13 +2317,16 @@ Next Steps
 6. Train staff on security procedures
 7. Verify NTS time sync: chronyc sources
 
-Ubuntu 25.x Specific Notes
+Ubuntu 26.04 LTS Specific Notes
 --------------------------
 - Cgroup v2 is now mandatory (v1 deprecated)
 - UTMP support removed from systemd
 - Chrony with NTS is the default time sync
-- OpenSSL 3.4.1+ and GnuTLS 3.8.9+ provide enhanced cryptography
-- Kernel 6.14+/6.17+ includes improved security features
+- OpenSSL 3.5 provides post-quantum cryptography by default
+- OpenSSH 10.2 uses hybrid post-quantum key exchange; DSA keys no longer work
+- sudo-rs is the default sudo (traditional sudo available as 'sudo.ws')
+- ~80 coreutils are Rust (uutils); GNU versions have a 'gnu' prefix
+- Linux 7.0 includes Attack Vector Controls and improved security features
 - Enhanced eBPF controls for better isolation
 
 Support and Maintenance
@@ -2235,9 +2374,9 @@ final_system_checks() {
 
     # Check firewall
     print_message "$BLUE" "Firewall Status:"
-    if ufw status | grep -q "Status: active"; then
+    if ufw status 2>/dev/null | grep "Status: active" > /dev/null; then
         print_message "$GREEN" "  ✓ UFW firewall is active"
-        ufw status numbered | grep -E "^\[[0-9]+\]" | head -5
+        ufw status numbered | grep -E "^\[[0-9]+\]" | head -5 || true
     else
         print_message "$RED" "  ✗ UFW firewall is not active"
     fi
@@ -2245,7 +2384,7 @@ final_system_checks() {
     # Check Chrony NTS
     print_message "$BLUE" "Time Synchronization:"
     if command -v chronyc &> /dev/null; then
-        if chronyc tracking | grep -q "Leap status     : Normal"; then
+        if chronyc tracking 2>/dev/null | grep "Leap status     : Normal" > /dev/null; then
             print_message "$GREEN" "  ✓ Chrony time sync active"
         else
             print_message "$YELLOW" "  ⚠ Chrony syncing (may take time)"
@@ -2254,7 +2393,7 @@ final_system_checks() {
 
     # Check for updates
     print_message "$BLUE" "Checking for remaining updates..."
-    if apt-get -s upgrade | grep -q "0 upgraded"; then
+    if apt-get -s upgrade 2>/dev/null | grep "0 upgraded" > /dev/null; then
         print_message "$GREEN" "  ✓ System is fully updated"
     else
         print_message "$YELLOW" "  ⚠ Updates are available"
@@ -2268,7 +2407,7 @@ main() {
     setup_directories
 
     print_message "$GREEN" "╔══════════════════════════════════════════════════════╗"
-    print_message "$GREEN" "║     Ubuntu 25.x Security Hardening Script            ║"
+    print_message "$GREEN" "║     Ubuntu 26.04 LTS Security Hardening Script       ║"
     print_message "$GREEN" "║              Version $SCRIPT_VERSION (Production)              ║"
     print_message "$GREEN" "╚══════════════════════════════════════════════════════╝"
 
@@ -2277,7 +2416,11 @@ main() {
 
     # Create system restore point notification
     print_message "$YELLOW" "Consider creating a system backup/snapshot before proceeding"
-    read -p "Press Enter to continue or Ctrl+C to cancel..."
+    if [[ -t 0 ]]; then
+        read -p "Press Enter to continue or Ctrl+C to cancel..."
+    else
+        print_message "$YELLOW" "Non-interactive session detected: proceeding without confirmation"
+    fi
 
     # Main hardening process
     print_message "$GREEN" "Starting security hardening process..."
@@ -2285,7 +2428,7 @@ main() {
     update_system
     install_packages
 
-    # Ubuntu 25.x specific - Configure Chrony NTS first
+    # Ubuntu 26.04 LTS specific - Configure Chrony NTS first
     configure_chrony_nts
 
     # Core security configurations
@@ -2302,8 +2445,8 @@ main() {
     configure_kernel_lockdown
     configure_openscap
 
-    # Ubuntu 25.x specific features
-    configure_ubuntu_25_features
+    # Ubuntu 26.04 LTS specific features
+    configure_ubuntu_26_features
 
     # Cloud instance security (AWS/Azure/GCP)
     configure_cloud_security
@@ -2327,11 +2470,12 @@ main() {
     print_message "$RED" "⚠️  CRITICAL: Verify SSH access from another terminal before disconnecting!"
     print_message "$RED" "⚠️  Review SSH settings in /etc/ssh/sshd_config.d/99-hardening.conf"
     print_message ""
-    print_message "$BLUE" "🔒 Ubuntu 25.x Features Enabled:"
+    print_message "$BLUE" "🔒 Ubuntu 26.04 LTS Features Enabled:"
     print_message "$BLUE" "   ✓ Chrony with NTS (Network Time Security)"
     print_message "$BLUE" "   ✓ Cgroup v2 resource controls"
-    print_message "$BLUE" "   ✓ Enhanced kernel hardening (6.14+/6.17+)"
-    print_message "$BLUE" "   ✓ OpenSSL 3.4.1+ cryptography"
+    print_message "$BLUE" "   ✓ Enhanced kernel hardening (Linux 7.0)"
+    print_message "$BLUE" "   ✓ Post-quantum cryptography (OpenSSL 3.5 / OpenSSH 10.2)"
+    print_message "$BLUE" "   ✓ Memory-safe system components (sudo-rs, Rust coreutils)"
     print_message ""
     print_message "$GREEN" "Next: Review the report and test all services before production use."
 }
